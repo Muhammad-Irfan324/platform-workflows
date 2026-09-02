@@ -1,0 +1,16 @@
+{
+  "name": "@fsc/platform-workflows-release-toolchain",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned semantic-release toolchain for release.yaml and terraform-release.yaml. Not installed from this directory — the workflows read these pins with jq and pass them to npm install --no-save. It is a real package.json so Dependabot's npm ecosystem can watch and bump them; written inside a workflow's shell command they were invisible to it, and six of eight had silently drifted, one by a full major. conventional-changelog-conventionalcommits is held at 9.x on purpose: 10.x requires conventional-changelog-writer@9, while @semantic-release/release-notes-generator@14 pulls writer@8, and the mismatch kills the release at generateNotes. Do not take the 10.x bump until release-notes-generator@15 is out of beta.",
+  "devDependencies": {
+    "semantic-release": "25.0.9",
+    "@semantic-release/commit-analyzer": "13.0.1",
+    "@semantic-release/release-notes-generator": "14.1.1",
+    "@semantic-release/changelog": "7.0.0",
+    "@semantic-release/exec": "7.1.0",
+    "@semantic-release/git": "11.0.1",
+    "@semantic-release/github": "12.0.9",
+    "conventional-changelog-conventionalcommits": "9.3.1"
+  }
+}

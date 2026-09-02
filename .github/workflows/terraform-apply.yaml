@@ -1,0 +1,232 @@
+---
+######################################################################
+# Reusable Terraform Apply
+######################################################################
+#
+# Applies infrastructure changes after merge to main. Runs behind a
+# GitHub environment, so approval gates and wait timers configured on
+# that environment apply before anything executes.
+#
+# Plans and applies atomically: it writes a plan file and applies that
+# file, never a diff recalculated between the two steps. A failing plan
+# stops the job before anything is applied.
+#
+# Trigger-agnostic by design. This workflow does not decide when it may
+# run — the caller does, through its own `on:` block and job `if:`.
+# Callers use it two ways today:
+#
+#   workflow_dispatch  a person picks resource + environment + action
+#   push to main       apply follows the merge automatically
+#
+# Restrict it in the caller (`if: github.ref == 'refs/heads/main'`), not
+# here, so one policy does not have to fit every consuming repo.
+#
+# Called by:  deployment repos, on push to main
+# Requires:   an OIDC-trusted IAM role; a configured GitHub environment;
+#             AUTOMATION_PAT for private module sources
+# Grants:     id-token: write · contents: read
+#
+# Usage:
+#   jobs:
+#     apply:
+#       uses: Muhammad-Irfan324/platform-workflows/.github/workflows/terraform-apply.yaml@v1
+#       with:
+#         working-directory: "./deployments/service"
+#         aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+#         terraform-version: "~1.15.9"
+#         backend-config: "config/backend.hcl"
+#         var-file: "env/production.tfvars"
+#         environment: "production"
+#       secrets:
+#         AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+#
+# Pin @v1, the same as every other workflow here. An exact pin on apply
+# sounds safer but is not: nobody bumps a manual pin, so apply drifts
+# behind plan and the two run different logic against the same directory.
+# v1 does not track main — it moves only when a release is cut, which
+# needs a reviewed, merged pull request in this repository.
+######################################################################
+
+name: "Reusable Terraform Apply"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Path to the Terraform deployment directory"
+        required: true
+        type: string
+      aws-role-arn:
+        description: "ARN of the IAM role to assume via OIDC"
+        required: true
+        type: string
+      aws-region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "eu-west-1"
+      backend-config:
+        description: "Path to backend config file (relative to working-directory)"
+        required: true
+        type: string
+      var-file:
+        description: "Path to tfvars file (relative to working-directory)"
+        required: true
+        type: string
+      environment:
+        description: "GitHub environment name for approval gates"
+        required: true
+        type: string
+      terraform-version:
+        description: "Terraform version to install (e.g. ~1.15.9, ~1.15.9)"
+        required: true
+        type: string
+    secrets:
+      AUTOMATION_PAT:
+        description: "PAT for accessing private Terraform modules"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  terraform_apply:
+    name: "Terraform Apply"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Two merges landing close together would otherwise start two applies
+    # against one state file: Terraform's lock kills whichever loses, and
+    # the run that failed is not obviously the one that needs re-running.
+    # Queue them instead. Never cancel — a half-finished apply has already
+    # changed real infrastructure.
+    concurrency:
+      group: tf-apply-${{ github.repository }}-${{ inputs.environment }}-${{ inputs.working-directory }}
+      cancel-in-progress: false
+    # TF_IN_AUTOMATION drops the "now run terraform apply" hints Terraform
+    # prints for a human at a terminal; TF_INPUT=false makes it fail with the
+    # real reason instead of blocking on a prompt nobody can answer, which
+    # otherwise burns the whole job timeout before saying anything useful.
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "false"
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assume AWS Role
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Configure private module access
+        env:
+          TOKEN: ${{ secrets.AUTOMATION_PAT }}
+        run: |
+          # Scoped to the org path so the token is not transmitted on
+          # public module and provider fetches.
+          git config --global \
+            url."https://${TOKEN}:x-oauth-basic@github.com/Muhammad-Irfan324/".insteadOf \
+            "https://github.com/Muhammad-Irfan324/"
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="${{ inputs.backend-config }}" \
+            -lock-timeout=5m
+
+      # Plan and apply are one atomic pair inside this run: apply executes
+      # a saved plan file, never a diff recalculated at apply time. That
+      # closes the window where state changes between the two.
+      #
+      # The plan from the pull request is deliberately NOT reused —
+      # artifacts are scoped to their run, and state can legitimately have
+      # moved on between the PR and the merge. Re-planning here and showing
+      # the result in the summary is both correct and auditable.
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set -uo pipefail
+
+          set +e
+          terraform plan \
+            -var-file="${{ inputs.var-file }}" \
+            -out=tfplan \
+            -lock-timeout=5m \
+            -no-color 2>&1 | tee plan_output.txt
+          EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::error title=Terraform plan failed::Nothing was applied. terraform plan exited ${EXIT}"
+            exit "$EXIT"
+          fi
+
+      - name: Terraform Apply
+        run: |
+          set -euo pipefail
+
+          # No -var-file: the saved plan already carries its variables.
+          terraform apply -auto-approve -lock-timeout=5m tfplan
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Same 1 MiB cap and tail-not-head reasoning as terraform-plan.
+          LIMIT=50000
+          {
+            echo "### Terraform Apply"
+            echo ""
+            echo "**Environment:** \`${{ inputs.environment }}\`"
+            echo "**Directory:** \`${{ inputs.working-directory }}\`"
+            echo "**Region:** \`${{ inputs.aws-region }}\`"
+            echo "**Terraform:** \`${{ inputs.terraform-version }}\`"
+            # Cancelled is not failed. A cancelled apply may have already
+            # changed real infrastructure part-way, and an operator reading
+            # "Failed" looks for an error that does not exist instead of
+            # checking what actually landed in state.
+            case "${{ job.status }}" in
+              success)   echo "**Status:** ✅ Applied successfully" ;;
+              cancelled) echo "**Status:** ⚪ Cancelled — check state for partial changes" ;;
+              *)         echo "**Status:** ❌ Failed" ;;
+            esac
+
+            # The plan this run actually applied. It was written to
+            # plan_output.txt and then shown nowhere, so the only record of
+            # what changed lived in the job log until that expired — while
+            # the comment above claims this step is the auditable record.
+            if [ -f plan_output.txt ]; then
+              echo ""
+              echo "<details>"
+              echo "<summary>Plan that was applied</summary>"
+              echo ""
+              if [ "$(wc -c < plan_output.txt)" -gt "$LIMIT" ]; then
+                echo "_Truncated to the last $((LIMIT / 1000)) KB — [full plan in this run](${RUN_URL})._"
+                echo ""
+              fi
+              echo '```terraform'
+              tail -c "$LIMIT" plan_output.txt
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

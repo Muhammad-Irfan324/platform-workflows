@@ -1,0 +1,9 @@
+# Every workflow here runs in ten other repositories, so a change merged
+# without review changes CI everywhere at once. Requiring an owner on
+# this repo is the cheapest guard against that.
+#
+# NOTE: this file only auto-requests reviewers. It blocks a merge only
+# once a ruleset on this repository turns on "Require review from Code
+# Owners", which needs admin access.
+
+* @Muhammad-Irfan324

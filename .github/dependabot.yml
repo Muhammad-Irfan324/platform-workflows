@@ -1,0 +1,127 @@
+---
+######################################################################
+# Dependabot
+######################################################################
+#
+# THE PREFIX IS `fix`, NOT `ci`, AND THAT IS DELIBERATE.
+#
+# Consuming repos pin @v1. That tag moves only when release.yaml cuts a
+# release, and semantic-release cuts one only for a releasable commit
+# type. `ci:` is not one — the conventionalcommits preset returns no
+# release for it, so the chain ended here: Dependabot bumped a pinned
+# SHA, the pull request merged, release.yaml found nothing releasable,
+# v1 did not move, and every repo on @v1 kept running the OLD action
+# until an unrelated fix: or feat: happened to ship and drag the tag
+# forward. A security bump is exactly the change that must not wait for
+# that. `fix:` cuts a patch, v1 moves, consumers pick it up next run.
+#
+# This applies to the npm entry too: terraform-release.yaml reads
+# configs/package.json out of the @v1 checkout, so a frozen v1 also
+# freezes the semantic-release toolchain in every module repo.
+######################################################################
+version: 2
+updates:
+  # Reusable workflows — bumps the SHA-pinned third-party actions.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "fix"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 10
+    # One pull request a week instead of one per outdated dependency.
+    # That matters more since the prefix above became `fix`: every merged
+    # bump now cuts a release, so five ungrouped bumps meant five reviews,
+    # five merges and five tags for what is really one week of updates.
+    #
+    # Majors stay ungrouped on purpose — those can need a code change, and
+    # they deserve to be read on their own rather than buried in a batch.
+    groups:
+      workflow-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # The semantic-release toolchain in configs/package.json. This entry is
+  # the whole reason that file exists: the pins used to be typed inside a
+  # workflow's shell command, where no ecosystem could see them.
+  - package-ecosystem: "npm"
+    directory: "/configs"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "fix"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    versioning-strategy: increase
+    # conventional-changelog-conventionalcommits@10 requires
+    # conventional-changelog-writer@9; @semantic-release/release-notes-generator@14
+    # pulls writer@8. Only one writer can be installed, so the two cannot coexist
+    # and the release dies rendering the notes — which is exactly how 1.0.0 failed
+    # on 2026-08-31, after semantic-release had already resolved the version.
+    #
+    # Dependabot opened that major once and will keep offering it, so this blocks
+    # the major only. 9.x minor and patch updates still come through. Delete this
+    # block once release-notes-generator@15 is out of beta and take 10.x with it.
+    ignore:
+      - dependency-name: "conventional-changelog-conventionalcommits"
+        update-types: ["version-update:semver-major"]
+    # Grouped for the same reason as the entries above.
+    groups:
+      semantic-release:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # The yamllint toolchain in configs/yamllint-requirements.txt. Same reason
+  # as the npm entry: --require-hashes pins the whole tree, and Dependabot
+  # rewrites the versions AND the digests together. Bumping those 77 hash
+  # lines by hand is not a thing anyone would keep doing.
+  - package-ecosystem: "pip"
+    directory: "/configs"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "fix"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    groups:
+      yamllint:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Composite actions. Nothing to bump today — load-tool-versions is pure
+  # bash — but this is here so a future `uses:` in an action.yaml is not
+  # silently left unwatched.
+  - package-ecosystem: "github-actions"
+    directory: "/actions/load-tool-versions"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "fix"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    # Grouped for the same reason as the entries above.
+    groups:
+      composite-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

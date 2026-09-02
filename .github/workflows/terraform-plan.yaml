@@ -1,0 +1,301 @@
+---
+######################################################################
+# Reusable Terraform Plan
+######################################################################
+#
+# Previews infrastructure changes on a pull request. Assumes an AWS
+# role via OIDC (no long-lived keys), runs fmt, init, validate and
+# plan, then posts the plan as a pull request comment, upserted on a
+# hidden marker so re-runs replace the comment rather than stacking.
+# That comment is the reviewable record — a failing plan comments too.
+#
+# Nothing is handed to terraform-apply. Apply writes and applies its own
+# plan in a single job, so it needs nothing from this run; state can also
+# legitimately move between the pull request and the merge.
+#
+# A failing plan fails the job. It previously did not: the plan was
+# piped to tee without pipefail, so the step's status came from the
+# final echo and a broken plan reported a green check.
+#
+# Called by:  deployment repos, on pull_request
+# Requires:   an OIDC-trusted IAM role; AUTOMATION_PAT
+#             for private module sources
+# Grants:     id-token: write · contents: read · pull-requests: write
+#
+# Usage:
+#   jobs:
+#     plan:
+#       uses: Muhammad-Irfan324/platform-workflows/.github/workflows/terraform-plan.yaml@v1
+#       with:
+#         working-directory: "./deployments/service"
+#         aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+#         terraform-version: "~1.15.9"
+#         backend-config: "config/backend.hcl"
+#         var-file: "env/staging.tfvars"
+#       secrets:
+#         AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+######################################################################
+
+name: "Reusable Terraform Plan"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Path to the Terraform deployment directory"
+        required: true
+        type: string
+      aws-role-arn:
+        description: "ARN of the IAM role to assume via OIDC"
+        required: true
+        type: string
+      aws-region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "eu-west-1"
+      backend-config:
+        description: "Path to backend config file (relative to working-directory)"
+        required: true
+        type: string
+      var-file:
+        description: "Path to tfvars file (relative to working-directory)"
+        required: true
+        type: string
+      terraform-version:
+        description: "Terraform version to install (e.g. ~1.15.9, ~1.15.9)"
+        required: true
+        type: string
+    secrets:
+      AUTOMATION_PAT:
+        description: "PAT for accessing private Terraform modules"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  terraform_plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Unlike apply, cancelling is right here: a plan changes nothing, and a
+    # second push to the same PR makes the running plan's output obsolete
+    # before it can be read.
+    concurrency:
+      group: tf-plan-${{ github.repository }}-${{ github.ref }}-${{ inputs.working-directory }}
+      cancel-in-progress: true
+    # TF_IN_AUTOMATION drops the "now run terraform apply" hints Terraform
+    # prints for a human at a terminal; TF_INPUT=false makes it fail with the
+    # real reason instead of blocking on a prompt nobody can answer, which
+    # otherwise burns the whole job timeout before saying anything useful.
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "false"
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assume AWS Role
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-session-name: ${{ github.event.repository.name }}-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Configure private module access
+        env:
+          TOKEN: ${{ secrets.AUTOMATION_PAT }}
+        run: |
+          # Scoped to the org path so the token is not transmitted on
+          # public module and provider fetches.
+          git config --global \
+            url."https://${TOKEN}:x-oauth-basic@github.com/Muhammad-Irfan324/".insteadOf \
+            "https://github.com/Muhammad-Irfan324/"
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        # -lock-timeout: plan and apply sit in different concurrency groups,
+        # so a pull-request plan can run while a merge apply holds the state
+        # lock. The default is 0s — fail instantly — which reports a timing
+        # collision as a broken plan. Wait instead.
+        run: |
+          terraform init \
+            -backend-config="${{ inputs.backend-config }}" \
+            -lock-timeout=5m
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set -uo pipefail
+
+          # No -out. The saved plan file was read by nothing: apply plans
+          # for itself, and the artifact that used to carry this one has
+          # been removed. The human-readable output below is the record.
+          set +e
+          terraform plan \
+            -var-file="${{ inputs.var-file }}" \
+            -lock-timeout=5m \
+            -no-color 2>&1 | tee plan_output.txt
+          EXIT=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=${EXIT}" >> "$GITHUB_OUTPUT"
+
+          # Without this the step's status is tee's, so a failed plan
+          # reported a green check.
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::error title=Terraform plan failed::terraform plan exited ${EXIT}"
+            exit "$EXIT"
+          fi
+
+      # The binary tfplan is deliberately NOT uploaded as an artifact.
+      # terraform-apply has no download-artifact step — it writes and applies
+      # its own plan in one job — so nothing ever read it, while it retained
+      # full resource attributes, sensitive values included, for five days
+      # to anyone with read access. Reviewers get the readable plan in the
+      # PR comment below; that is the reviewable record.
+
+      # !cancelled(), so a FAILING plan still reports. Without it this step was
+      # skipped on failure and the PR showed a red check with no comment
+      # explaining it — the reviewer had to open the run to learn anything.
+      #
+      # Not always(): that fired on cancellation too, posting "❌ Terraform
+      # Plan failed" for a run somebody deliberately stopped — or one this
+      # workflow's own cancel-in-progress superseded, which is every push
+      # after the first.
+      - name: Comment plan on pull request
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const dir = process.env.WORKING_DIRECTORY;
+            const marker = `<!-- tf-plan:${dir} -->`;
+            const ok = process.env.PLAN_OUTCOME === 'success';
+
+            // Absent when an earlier step (init, validate) failed and plan
+            // never ran. Missing output is not a reason to fail this step.
+            let plan = '';
+            try {
+              plan = fs.readFileSync(`${dir}/plan_output.txt`, 'utf8');
+            } catch {
+              plan = '';
+            }
+
+            // GitHub rejects comments over ~65KB.
+            const LIMIT = 55000;
+            let truncated = false;
+            if (plan.length > LIMIT) {
+              plan = plan.slice(-LIMIT);
+              truncated = true;
+            }
+
+            // Expanded on failure — the error is the point of the comment,
+            // so it should not sit behind a click.
+            const detail = plan
+              ? [
+                  `<details${ok ? '' : ' open'}><summary>${ok ? 'Show plan' : 'Show error'}</summary>`,
+                  '',
+                  '```terraform',
+                  plan,
+                  '```',
+                  '',
+                  '</details>',
+                ]
+              : ['_No output — an earlier step failed before plan ran. See the workflow run._'];
+
+            const body = [
+              marker,
+              ok ? `### Terraform Plan — \`${dir}\``
+                 : `### ❌ Terraform Plan failed — \`${dir}\``,
+              '',
+              truncated ? '_Output truncated — see the workflow run for the full plan._' : '',
+              ...detail,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments, { owner, repo, issue_number }
+            );
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            // Upsert keyed on the marker so re-runs replace rather than spam.
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # The step summary is capped at 1 MiB and GitHub drops the WHOLE
+          # summary on overflow — the directory and version lines above go
+          # with it — so `cat` of an unbounded plan could lose everything.
+          #
+          # Tail, not head: "Plan: N to add, N to change" and any error text
+          # sit at the end. The complete output stays in this run's log,
+          # which the truncation notice links to.
+          LIMIT=50000
+          {
+            echo "### Terraform Plan"
+            echo ""
+            echo "**Directory:** \`${{ inputs.working-directory }}\`"
+            echo "**Region:** \`${{ inputs.aws-region }}\`"
+            echo "**Terraform:** \`${{ inputs.terraform-version }}\`"
+            # Same three-way split apply uses. Without a status line the only
+            # way to tell a clean plan from a broken one was to read to the
+            # bottom of the output — and on a cancelled run, where plan_output
+            # may not exist at all, the summary said nothing whatsoever.
+            # Cancelled is not failed: this workflow cancels superseded runs
+            # by design, so it is the expected state on every push after the
+            # first, and must not read as an error.
+            case "${{ job.status }}" in
+              success)   echo "**Status:** ✅ Plan completed" ;;
+              cancelled) echo "**Status:** ⚪ Cancelled — superseded by a newer push, or stopped" ;;
+              *)         echo "**Status:** ❌ Failed — no infrastructure was changed" ;;
+            esac
+            echo ""
+            if [ -f plan_output.txt ]; then
+              echo "<details>"
+              echo "<summary>Plan output</summary>"
+              echo ""
+              if [ "$(wc -c < plan_output.txt)" -gt "$LIMIT" ]; then
+                echo "_Truncated to the last $((LIMIT / 1000)) KB — [full plan in this run](${RUN_URL})._"
+                echo ""
+              fi
+              echo '```terraform'
+              tail -c "$LIMIT" plan_output.txt
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

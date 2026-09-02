@@ -1,0 +1,27 @@
+---
+######################################################################
+# Default terraform-docs configuration for Terraform modules
+######################################################################
+#
+# terraform-module-ci copies this into a module repo that does not
+# provide its own terraform-docs config. A committed file in the module
+# repo always wins.
+#
+# Kept as a real file so a developer can reproduce CI's output locally
+# with the same settings:
+#
+#   terraform-docs .
+######################################################################
+
+formatter: markdown table
+
+output:
+  file: README.md
+  mode: inject
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  read-comments: true

@@ -1,0 +1,376 @@
+---
+######################################################################
+# Workflow CI — self-check
+######################################################################
+#
+# This repository's own CI. Every other workflow here runs in ten other
+# repositories, so a mistake merged to main breaks all of them at once.
+# These checks are the guard against that:
+#
+#   actionlint    · workflow syntax, expression and shell errors
+#   yamllint      · formatting and structure
+#   SHA-pin gate  · every third-party action is pinned to a commit SHA,
+#                   never a mutable tag
+#   release guard · the hardcoded workflows-ref default still matches
+#                   the major this PR would release
+#
+# The SHA-pin gate matches both `uses:` and `- uses:` forms, and covers
+# actions/ as well as .github/workflows/. Local ./ references are our
+# own composite actions and carry no external SHA to pin.
+#
+# Called by:  this repository only, on pull_request
+# Grants:     contents: read
+######################################################################
+
+name: "Workflow CI"
+
+on:
+  # No paths: filter. It skipped this workflow entirely for a pull request
+  # touching only README.md or CODEOWNERS — so a required "Workflow CI" check
+  # would sit pending forever and block the merge on a check that never starts.
+  # The repository is small; running everything costs less than that failure.
+  pull_request:
+    branches: [main]
+  # Also on main itself. A pull_request-only trigger left a direct push or an
+  # admin bypass completely unchecked, while release.yaml tags whatever lands
+  # here — so broken YAML could reach @v1 in every consuming repo without a
+  # single gate having run.
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: "Lint Workflows"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load central versions
+        uses: ./actions/load-tool-versions
+
+      - name: Install actionlint
+        run: |
+          # Downloaded to a file rather than piped into tar, because the
+          # digest has to be checked BEFORE anything is extracted and run.
+          # A release asset can be swapped the same way a mutable tag can
+          # move — which is the whole reason every `uses:` here is SHA-pinned.
+          # This closes the same hole on the binaries the gate cannot see.
+          #
+          # -f so a 404 or 5xx fails here rather than handing an HTML error
+          # page to sha256sum.
+          set -euo pipefail
+          curl -fsSLo actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz -C /usr/local/bin actionlint
+          rm -f actionlint.tar.gz
+
+      - name: Run actionlint
+        id: actionlint
+        run: actionlint -color
+
+      - name: Install yamllint
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: |
+          # --require-hashes, so a swapped artifact on PyPI fails here rather
+          # than running. It demands the whole tree be pinned, which is why
+          # configs/yamllint-requirements.txt carries pathspec and pyyaml too.
+          #
+          # The version lives in that file, not versions.env: --require-hashes
+          # means version and digests must move together, and Dependabot's pip
+          # ecosystem rewrites both. Split across two files they would drift.
+          set -euo pipefail
+          python -m pip install --no-cache-dir --require-hashes \
+            -r configs/yamllint-requirements.txt
+
+      - name: Run yamllint
+        id: yamllint
+        run: |
+          # -s makes warnings fail too: a warning nobody is required to fix
+          # is a warning that accumulates until the output is worth ignoring.
+          #
+          # Covers every YAML this repository ships, not just workflows.
+          # dependabot.yml, the composite action and configs/ are all read by
+          # other repos, and configs/.terraform-docs.yaml is copied verbatim
+          # into them — none of it was linted while only workflows were.
+          yamllint -s -d "{extends: default, rules: {line-length: {max: 200}, truthy: disable}}" \
+            .github/ actions/ configs/
+
+          # yamllint reads only .yaml/.yml, so configs/*.json went unchecked
+          # while sitting in a directory this step claims to cover. Both are
+          # read at runtime by other repos — a malformed .releaserc.json stops
+          # releases everywhere, and package.json is parsed with jq by both
+          # release workflows — so a syntax error here is not a local problem.
+          #
+          # find, not configs/*.json: a bash glob skips dotfiles, so that
+          # pattern matched package.json alone and quietly stepped over
+          # .releaserc.json — the one file whose syntax stops releases in
+          # every module repo. A check that misses the file it exists for is
+          # worse than no check, because the green tick is believed.
+          set -euo pipefail
+          mapfile -t CONFIG_JSON < <(find configs -maxdepth 1 -name '*.json' | sort)
+          if [ "${#CONFIG_JSON[@]}" -eq 0 ]; then
+            echo "::error::No JSON found under configs/ — this check is stale."
+            exit 1
+          fi
+          for config in "${CONFIG_JSON[@]}"; do
+            jq empty "$config" \
+              || { echo "::error file=${config}::Invalid JSON."; exit 1; }
+            echo "  ok  $config"
+          done
+
+      - name: Verify SHA-pinned actions
+        id: shapin
+        run: |
+          # '^\s*uses:' missed the inline list form, so '- uses: x@v4'
+          # passed the gate cleanly. Local './' references are our own
+          # composite actions and carry no external SHA to pin.
+          # Both extensions on both sides: a workflow or action file added
+          # as .yml must not slip past the gate on a glob technicality.
+          #
+          # Comments are stripped before the SHA test, so the gate reads the
+          # ref rather than the annotation beside it. A trailing '# vX.Y.Z'
+          # was already safe — the test needs '@' immediately before the 40
+          # hex — but a comment naming another action DID satisfy it:
+          #   uses: foo/bar@v1  # was foo/bar@3d3c42e5aac...
+          # passed the gate as pinned while running a mutable tag. Plausible
+          # in a rollback or a 'see also', and this gate is the only thing
+          # between a moved tag and ten repositories.
+          VIOLATIONS=$(grep -rnE '^[[:space:]]*(-[[:space:]]+)?uses:' \
+              .github/workflows/*.yaml .github/workflows/*.yml \
+              actions/*/action.yml actions/*/action.yaml 2>/dev/null \
+            | sed 's/#.*//' \
+            | grep -vE '@[0-9a-f]{40}' \
+            | grep -vE 'uses:[[:space:]]*\./' \
+            || true)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "::error::The following action references are not SHA-pinned:"
+            echo "$VIOLATIONS"
+            exit 1
+          fi
+          echo "All third-party action references are SHA-pinned."
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          # Read outcome, which GitHub sets, rather than an output each step
+          # had to write for itself. A step skipped because an earlier one
+          # failed has no output, and the old `== 'pass'` test rendered that
+          # empty value as a second ❌ Fail — so one real failure was reported
+          # as three. The release guard job below already did it this way.
+          status() {
+            case "$1" in
+              success)     echo "✅ Pass" ;;
+              failure)     echo "❌ Fail" ;;
+              cancelled)   echo "⚪ Cancelled" ;;
+              ""|skipped)  echo "⬜ Did not run" ;;
+              *)           echo "⬜ $1" ;;
+            esac
+          }
+          {
+            echo "### Workflow CI"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| actionlint | $(status '${{ steps.actionlint.outcome }}') |"
+            echo "| yamllint | $(status '${{ steps.yamllint.outcome }}') |"
+            echo "| SHA-pin check | $(status '${{ steps.shapin.outcome }}') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Release guard ────────────────────────────────────────────────────
+  # workflows-ref carries a hardcoded major ("v1"). A reusable workflow
+  # cannot discover its own ref, so that default is the only thing telling
+  # the runtime checkout which versions.env and configs/ to read.
+  #
+  # The day a breaking change cuts v2, that line still says "v1" and v2's
+  # workflows would quietly read v1's tool versions. This job fails the PR
+  # that would cause it, while the fix is still one line in the same branch.
+  #
+  # It reads the PR title and EVERY commit in the PR, because this repo
+  # squashes with squash_merge_commit_message=COMMIT_MESSAGES: the squashed
+  # body is all commit messages concatenated, so a BREAKING CHANGE footer
+  # in any commit reaches main and cuts a major. Title alone is not enough.
+  release_guard:
+    name: "Release Guard"
+    # Pull requests only. This job reads the PR's commit list, and there is
+    # no PR on a push. The lint job above is the part that must cover main.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The guard script below imports yaml. Nothing installed it — the
+      # script relied on the runner image happening to ship PyYAML, which is
+      # not a documented guarantee and changes when GitHub rebuilds the image.
+      # This job is what stops a breaking change shipping with a stale
+      # workflows-ref, so it should not rest on that.
+      #
+      # Pinned inline rather than in versions.env because this job does not
+      # load versions.env, and checkov-terraform.yaml pins the same two
+      # values the same way — it deliberately takes no secrets, so it cannot
+      # check out this repository to read them.
+      #
+      # The two do NOT have to match, and there is nothing to keep in step.
+      # Each job runs its own self-contained script against its own files;
+      # they share no output and no parsing contract, so one moving without
+      # the other has no effect. Matching today is coincidence, not a rule —
+      # do not add a check enforcing it.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install guard dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install --no-cache-dir pyyaml==6.0.3
+
+      - name: Collect release signals
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # One commit message per line, JSON-escaped. A raw dump would let
+          # the blank line between a subject and its body look like a record
+          # boundary, splitting one commit into two.
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --paginate --jq '.[].commit.message | @json' > pr_commits.jsonl
+
+          # Latest release tag, or empty when the repo has none yet. Read from
+          # the API rather than git, since the checkout is shallow. The API
+          # call is kept off the pipeline so a failure fails the step instead
+          # of silently reading as "no releases".
+          gh api "repos/${GITHUB_REPOSITORY}/tags" --paginate --jq '.[].name' > all_tags.txt
+          grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' all_tags.txt \
+            | sort -V | tail -1 > latest_tag.txt || true
+
+          echo "Latest tag: $(cat latest_tag.txt || echo '(none)')"
+
+      - name: Verify workflows-ref matches the next major
+        id: guard
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import glob, json, os, re, sys, yaml
+
+          # `feat!:` and a `BREAKING CHANGE:` footer are the same rule in two
+          # notations; the spec allows the hyphenated form too.
+          SUBJECT_BANG = re.compile(r'^[A-Za-z]+(\([^)]*\))?!:')
+          FOOTER = re.compile(r'^BREAKING[ -]CHANGE:', re.MULTILINE)
+
+          def is_breaking(message):
+              first = message.splitlines()[0] if message.strip() else ""
+              return bool(SUBJECT_BANG.match(first) or FOOTER.search(message))
+
+          messages = [os.environ.get("PR_TITLE", "")]
+          with open("pr_commits.jsonl") as fh:
+              messages.extend(json.loads(line) for line in fh if line.strip())
+
+          breaking = [m.splitlines()[0] for m in messages if is_breaking(m)]
+
+          with open("latest_tag.txt") as fh:
+              latest = fh.read().strip()
+
+          # No releases yet: semantic-release starts at 1.0.0 even for a
+          # breaking change, so the expected major is v1 either way.
+          if not latest:
+              expected, why = "v1", "no releases yet — the first will be 1.0.0"
+          else:
+              major = int(latest.lstrip("v").split(".")[0])
+              if breaking:
+                  expected = f"v{major + 1}"
+                  why = f"breaking change on top of {latest}"
+              else:
+                  expected = f"v{major}"
+                  why = f"no breaking change since {latest}"
+
+          print(f"Latest tag: {latest or '(none)'}")
+          print(f"Expected workflows-ref default: {expected}  ({why})")
+          for subject in breaking:
+              print(f"  breaking: {subject}")
+
+          checked, offenders = [], []
+          for path in sorted(glob.glob(".github/workflows/*.yaml")
+                             + glob.glob(".github/workflows/*.yml")):
+              with open(path) as fh:
+                  doc = yaml.safe_load(fh) or {}
+              # PyYAML 1.1 reads a bare `on:` key as the boolean True.
+              on = doc.get("on", doc.get(True))
+              call = on.get("workflow_call") if isinstance(on, dict) else None
+              spec = (call.get("inputs") or {}).get("workflows-ref") \
+                  if isinstance(call, dict) else None
+              if not isinstance(spec, dict):
+                  continue
+              actual = str(spec.get("default", ""))
+              checked.append(path)
+              if actual != expected:
+                  offenders.append((path, actual))
+
+          if not checked:
+              print("::error title=Release guard has nothing to check::"
+                    "No workflow declares a workflows-ref input. "
+                    "Either the input was removed or this guard is stale.")
+              sys.exit(1)
+
+          for path, actual in offenders:
+              print(f"::error file={path}::workflows-ref default is "
+                    f"'{actual}' but this PR releases {expected}. "
+                    f"Update it, or {expected}'s workflows will read "
+                    f"{actual}'s versions.env and configs/.")
+
+          if offenders:
+              sys.exit(1)
+
+          print(f"OK — {len(checked)} workflow(s) default to {expected}.")
+          PY
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          # Same reasoning as the lint job's summary: guard is skipped when
+          # the signal-collection step above fails, and a bare == 'success'
+          # test renders that as ❌ Fail — reporting a check that never ran
+          # as a check that found a problem.
+          status() {
+            case "$1" in
+              success)     echo "✅ Pass" ;;
+              failure)     echo "❌ Fail" ;;
+              cancelled)   echo "⚪ Cancelled" ;;
+              ""|skipped)  echo "⬜ Did not run" ;;
+              *)           echo "⬜ $1" ;;
+            esac
+          }
+          {
+            echo "### Release Guard"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| workflows-ref matches next major | $(status '${{ steps.guard.outcome }}') |"
+          } >> "$GITHUB_STEP_SUMMARY"

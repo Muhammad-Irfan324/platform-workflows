@@ -1,0 +1,391 @@
+---
+######################################################################
+# Reusable Application CI
+######################################################################
+#
+# Validates, scans and builds a containerised application on every
+# pull request. Runs the following checks in order:
+#
+#   lint · unit tests · integration tests
+#   SonarQube (SAST) · OWASP Dependency-Check · Gitleaks
+#   Docker build · Trivy (container scan → SARIF to Security tab)
+#   Push with SLSA provenance attestation + SBOM
+#
+# On merge to main the pipeline additionally pushes the image to the
+# GitLab Container Registry and optionally updates a GitOps manifest
+# for ArgoCD deployment.
+#
+# Called by:  application repos, on pull_request and push to main
+# Requires:   SONAR_TOKEN for SonarQube (token only — host URL is an input);
+#             REGISTRY_USER + REGISTRY_TOKEN for GitLab CR push
+#               (use a GitLab Deploy Token or Project Access Token,
+#                scoped to read_registry + write_registry — never a
+#                personal password);
+#             AUTOMATION_PAT for private dependencies
+# Grants:     contents: read · pull-requests: write
+#             security-events: write (for SARIF upload)
+#
+# Usage:
+#   jobs:
+#     app_ci:
+#       name: "Application CI"
+#       uses: Muhammad-Irfan324/platform-workflows/.github/workflows/application-ci.yaml@v1
+#       with:
+#         working-directory: "."
+#         node-version: "20"
+#         docker-context: "."
+#         registry-url: "registry.gitlab.com"
+#         image-name: "my-group/my-service"
+#         sonar-host-url: ${{ vars.SONAR_HOST_URL }}   # GitHub Variable, not a secret
+#       secrets:
+#         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+#         REGISTRY_USER: ${{ secrets.REGISTRY_USER }}   # GitLab Deploy Token name
+#         REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }} # GitLab Deploy Token value
+######################################################################
+
+name: "Reusable Application CI"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Path to the application root directory"
+        required: false
+        type: string
+        default: "."
+      node-version:
+        description: "Node.js version for build and test"
+        required: false
+        type: string
+        default: "20"
+      docker-context:
+        description: "Docker build context path"
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: "Path to Dockerfile relative to docker-context"
+        required: false
+        type: string
+        default: "Dockerfile"
+      registry-url:
+        description: "Container registry URL (e.g. registry.gitlab.com)"
+        required: false
+        type: string
+        default: "registry.gitlab.com"
+      image-name:
+        description: "Image name including group/project path (e.g. my-group/my-service)"
+        required: false
+        type: string
+        default: ""
+      run-integration-tests:
+        description: "Whether to run integration tests"
+        required: false
+        type: boolean
+        default: true
+      sonar-project-key:
+        description: "SonarQube project key"
+        required: false
+        type: string
+        default: ""
+      trivy-severity:
+        description: "Trivy severity threshold (CRITICAL,HIGH,MEDIUM)"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      push-image:
+        description: "Whether to push the built image to the registry (typically true on main only)"
+        required: false
+        type: boolean
+        default: false
+      sonar-host-url:
+        description: "SonarQube server URL (not a secret — use GitHub Variables: vars.SONAR_HOST_URL)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SONAR_TOKEN:
+        description: "SonarQube authentication token (project-scoped analysis token)"
+        required: false
+      REGISTRY_USER:
+        description: "GitLab Deploy Token name (or project/group access token username)"
+        required: false
+      REGISTRY_TOKEN:
+        description: "GitLab Deploy Token value (scoped to read_registry + write_registry)"
+        required: false
+      AUTOMATION_PAT:
+        description: "PAT for accessing private dependencies"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: "Lint & Test"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: app-ci-test-${{ github.repository }}-${{ github.ref }}-${{ inputs.working-directory }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        id: lint
+        run: npm run lint --if-present
+
+      - name: Unit tests
+        id: unit_tests
+        run: npm test
+
+      - name: Integration tests
+        id: integration_tests
+        if: ${{ inputs.run-integration-tests }}
+        run: npm run test:integration --if-present
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          status() {
+            case "$1" in
+              success)     echo "✅ Pass" ;;
+              failure)     echo "❌ Fail" ;;
+              cancelled)   echo "⚪ Cancelled" ;;
+              ""|skipped)  echo "⏭️ Skip" ;;
+              *)           echo "⬜ $1" ;;
+            esac
+          }
+          {
+            echo "### Lint & Test"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Lint | $(status '${{ steps.lint.outcome }}') |"
+            echo "| Unit Tests | $(status '${{ steps.unit_tests.outcome }}') |"
+            echo "| Integration Tests | $(status '${{ steps.integration_tests.outcome }}') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  security-scan:
+    name: "Security Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: app-ci-security-${{ github.repository }}-${{ github.ref }}-${{ inputs.working-directory }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      security-events: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── SAST: SonarQube ──────────────────────────────────────────────
+      - name: SonarQube Scan
+        id: sonar
+        if: ${{ inputs.sonar-project-key != '' }}
+        uses: SonarSource/sonarqube-scan-action@2500896589ef8f7247069a56136f8dc177c27ccf  # v5.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ inputs.sonar-host-url }}
+        with:
+          projectBaseDir: ${{ inputs.working-directory }}
+          args: >
+            -Dsonar.projectKey=${{ inputs.sonar-project-key }}
+
+      # ── Dependency Scanning: OWASP Dependency-Check ──────────────────
+      - name: OWASP Dependency-Check
+        id: owasp
+        uses: dependency-check/Dependency-Check_Action@75ba02d6183445fe0761d26e836bde58b1560600  # v1.1.0
+        with:
+          project: ${{ github.event.repository.name }}
+          path: ${{ inputs.working-directory }}
+          format: HTML
+          args: >
+            --failOnCVSS 7
+            --enableExperimental
+
+      - name: Upload OWASP report
+        if: always() && steps.owasp.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: owasp-dependency-check-report
+          path: reports/
+          retention-days: 14
+
+      # ── Secret Scanning: Gitleaks ────────────────────────────────────
+      - name: Gitleaks
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@f586c14365d4643c6aa59d472ae6e984bf47bb34  # v2.3.8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          status() {
+            case "$1" in
+              success)     echo "✅ Pass" ;;
+              failure)     echo "❌ Fail" ;;
+              cancelled)   echo "⚪ Cancelled" ;;
+              ""|skipped)  echo "⏭️ Skip" ;;
+              *)           echo "⬜ $1" ;;
+            esac
+          }
+          {
+            echo "### Security Scan"
+            echo ""
+            echo "| Scan | Result |"
+            echo "| --- | --- |"
+            echo "| SonarQube (SAST) | $(status '${{ steps.sonar.outcome }}') |"
+            echo "| OWASP Dependency-Check | $(status '${{ steps.owasp.outcome }}') |"
+            echo "| Gitleaks (Secret Scanning) | $(status '${{ steps.gitleaks.outcome }}') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  docker-build-scan:
+    name: "Docker Build & Scan"
+    needs: [lint-and-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: app-ci-docker-${{ github.repository }}-${{ github.ref }}-${{ inputs.working-directory }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3.10.0
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804  # v5.7.0
+        with:
+          images: |
+            ${{ inputs.image-name != '' && format('{0}/{1}', inputs.registry-url, inputs.image-name) || 'local/app' }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1  # v6.16.0
+        with:
+          context: ${{ inputs.docker-context }}
+          file: ${{ inputs.docker-context }}/${{ inputs.dockerfile }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Container Scanning: Trivy ────────────────────────────────────
+      - name: Trivy vulnerability scan
+        id: trivy
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37  # v0.31.0
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "1"
+          severity: ${{ inputs.trivy-severity }}
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to Security tab
+        if: always() && steps.trivy.outcome != 'skipped'
+        uses: github/codeql-action/upload-sarif@ff0a06e83cb2de871e5a09832bc6a81e7276941f  # v3.28.18
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-container
+
+      # ── Push to GitLab Container Registry ────────────────────────────
+      - name: Login to GitLab Container Registry
+        if: ${{ inputs.push-image && inputs.image-name != '' }}
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ${{ inputs.registry-url }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Push image to registry
+        if: ${{ inputs.push-image && inputs.image-name != '' }}
+        id: push
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1  # v6.16.0
+        with:
+          context: ${{ inputs.docker-context }}
+          file: ${{ inputs.docker-context }}/${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          provenance: true
+          sbom: true
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          status() {
+            case "$1" in
+              success)     echo "✅ Pass" ;;
+              failure)     echo "❌ Fail" ;;
+              cancelled)   echo "⚪ Cancelled" ;;
+              ""|skipped)  echo "⏭️ Skip" ;;
+              *)           echo "⬜ $1" ;;
+            esac
+          }
+          {
+            echo "### Docker Build & Scan"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Docker Build | $(status '${{ steps.build.outcome }}') |"
+            echo "| Trivy Container Scan | $(status '${{ steps.trivy.outcome }}') |"
+            echo "| Push to Registry | $(status '${{ steps.push.outcome }}') |"
+          } >> "$GITHUB_STEP_SUMMARY"

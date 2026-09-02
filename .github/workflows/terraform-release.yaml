@@ -1,0 +1,214 @@
+---
+######################################################################
+# Reusable Terraform Release
+######################################################################
+#
+# Publishes a new module version on push to main. Reads conventional
+# commit messages since the last tag to decide the bump:
+#
+#   fix:                        → patch   (v1.0.0 → v1.0.1)
+#   feat:                       → minor   (v1.0.0 → v1.1.0)
+#   feat!:  (or any type + !)   → major   (v1.0.0 → v2.0.0)
+#   BREAKING CHANGE: footer     → major   (v1.0.0 → v2.0.0)
+#   anything else               → no release
+#
+# `!` and the BREAKING CHANGE footer are one rule in two notations.
+#
+# "anything else" is about the SUBJECT only. A breaking marker forces a
+# major whatever the type says, so a chore:-titled commit carrying a
+# BREAKING CHANGE footer still cuts one — it is not a safe no-op.
+#
+# Every commit counts, not just the pull request title: this org squashes
+# with COMMIT_MESSAGES, so the squashed body is every commit message in
+# the PR concatenated and semantic-release reads all of it.
+#
+# Writes CHANGELOG.md, creates the git tag, and publishes a GitHub
+# release. A default .releaserc.json is generated when the calling repo
+# does not provide its own, so every module releases identically.
+#
+# A semantic-release failure fails this job. It previously did not,
+# which meant releases could stop silently.
+#
+# Called by:  module repos (terraform-*), on push to main
+# Requires:   a token with contents: write, and the CALLER granting
+#             contents: write · issues: write · pull-requests: write.
+#             A reusable workflow can only narrow its caller's scope, and
+#             @semantic-release/github's success step comments on the
+#             issues and pull requests that shipped.
+# Note:       @semantic-release/git pushes CHANGELOG.md straight to
+#             main, so a branch-protection ruleset will reject it unless
+#             the release identity is granted a bypass.
+#
+# Usage:
+#   jobs:
+#     release:
+#       permissions:
+#         contents: write
+#         issues: write
+#         pull-requests: write
+#       uses: Muhammad-Irfan324/platform-workflows/.github/workflows/terraform-release.yaml@v1
+#       secrets:
+#         TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#         AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+######################################################################
+
+name: "Reusable Terraform Release"
+
+# Two merges to main in quick succession would otherwise race on tag
+# creation and the CHANGELOG push. Never cancel a half-finished release.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+on:
+  workflow_call:
+    inputs:
+      workflows-ref:
+        description: >-
+          Ref of platform-workflows to read versions.env and configs/ from.
+          A reusable workflow cannot discover its own ref — GitHub exposes
+          only the CALLER's via github.workflow_ref — so this cannot be
+          derived and must be stated. Left unset, the checkout below would
+          silently track the default branch, and a caller on @v1 would run
+          v1's logic against main's tool versions. Pin it to the same tag
+          as your `uses:` line when configs and logic must move together.
+        required: false
+        type: string
+        default: "v1"
+    secrets:
+      TOKEN:
+        description: "GitHub token with contents:write permission for creating releases"
+        required: true
+      AUTOMATION_PAT:
+        description: "PAT used to read the central .releaserc.json from platform-workflows"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: "Semantic Release"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # @semantic-release/github's `success` step posts "included in release"
+    # comments on the pull requests and issues that shipped, which needs
+    # issues: write and pull-requests: write. With contents: write alone it
+    # fails "Resource not accessible by integration" — AFTER the tag and the
+    # GitHub release have already been published. v1.0.0 shipped exactly that
+    # way on 2026-08-31: released successfully, job red, major tag skipped.
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history needed for semantic-release to determine version bumps
+          fetch-depth: 0
+          persist-credentials: false
+
+      # `./` in a reusable workflow resolves against the CALLER's checkout,
+      # so platform-workflows must be fetched to reach its own configs/.
+      - name: Fetch central configs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Muhammad-Irfan324/platform-workflows
+          ref: ${{ inputs.workflows-ref }}
+          path: .platform-workflows
+          sparse-checkout: |
+            versions.env
+            actions
+            configs
+          token: ${{ secrets.AUTOMATION_PAT }}
+          persist-credentials: false
+
+      - name: Load central tool versions
+        uses: ./.platform-workflows/actions/load-tool-versions
+
+      - name: Apply default config
+        run: |
+          set -euo pipefail
+
+          if [ -f ".releaserc.json" ]; then
+            echo "Using this repository's own .releaserc.json."
+          else
+            cp "${GITHUB_WORKSPACE}/.platform-workflows/configs/.releaserc.json" .releaserc.json
+            echo "No .releaserc.json found — applied the central default."
+          fi
+
+          # The npm pins live in configs/package.json so Dependabot can see
+          # them. Read them out now — .platform-workflows is deleted on the next
+          # line, well before the install step runs.
+          jq -r '.devDependencies | to_entries[] | "\(.key)@\(.value)"' \
+            "${GITHUB_WORKSPACE}/.platform-workflows/configs/package.json" \
+            > "${RUNNER_TEMP}/semantic-release-deps.txt"
+
+          # Removed before semantic-release runs so @semantic-release/git
+          # never sees it as a repository change.
+          rm -rf "${GITHUB_WORKSPACE}/.platform-workflows"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install semantic-release
+        run: |
+          set -euo pipefail
+
+          # One list, shared with release.yaml, so the two cannot drift onto
+          # different versions of the code that decides what a commit means.
+          # commit-analyzer and release-notes-generator ship inside
+          # semantic-release but are pinned anyway, for that same reason.
+          mapfile -t DEPS < "${RUNNER_TEMP}/semantic-release-deps.txt"
+          echo "Installing: ${DEPS[*]}"
+          npm install --no-save "${DEPS[@]}"
+
+      - name: Run semantic-release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # No `|| true`. A `|| true` here discarded the exit code, so an
+          # auth failure, a plugin error, or @semantic-release/git being
+          # rejected by branch protection all produced a GREEN job
+          # summarised as "no release triggered" — releases silently
+          # stopped and nobody found out.
+          npx semantic-release
+
+          # The version is read from the file the exec plugin writes, not
+          # scraped from stdout — semantic-release's log wording is not a
+          # documented interface.
+          if [ -f .release-version ]; then
+            echo "version=$(cat .release-version)" >> "$GITHUB_OUTPUT"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Summary ──────────────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          # Three outcomes, not two. `released` is empty both when there was
+          # nothing to release AND when semantic-release failed, so keying on
+          # it alone reported a failure as "no relevant commits" — exactly the
+          # silent-stop this workflow's header says it fixed by dropping the
+          # `|| true`. The exit code was fixed; this message was not.
+          {
+            echo "### Semantic Release"
+            echo ""
+            if [ "${{ steps.release.outcome }}" != "success" ]; then
+              echo "❌ Release failed — semantic-release did not complete. Nothing was"
+              echo "published. See the step log; this is not a no-op."
+            elif [ "${{ steps.release.outputs.released }}" == "true" ]; then
+              echo "✅ Published **v${{ steps.release.outputs.version }}**"
+            else
+              echo "⬜ No release triggered (no relevant commits since last release)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

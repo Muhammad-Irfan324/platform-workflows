@@ -1,0 +1,422 @@
+---
+######################################################################
+# Reusable Checkov Terraform
+######################################################################
+#
+# Scans Terraform for security findings on every pull request, giving
+# callers one stable "Checkov Terraform" status. Scanning is delegated
+# to the official Checkov action, pinned by commit SHA.
+#
+# Needs no secrets and no cloud credentials, and never runs terraform
+# init, plan or apply — it reads the caller's checked-out files only.
+#
+# A module repo's own .checkov.yaml is validated against a strict schema
+# before the scan: skip-check and skip-path are the only accepted keys,
+# so a repo cannot disable its own gate with soft-fail.
+#
+# Runs as its OWN job alongside terraform-module-ci, never inside it.
+# Inline it there as well and every PR gets two scans under two configs,
+# free to disagree on the same commit.
+#
+# Called by:  module repos and deployment repos, on pull_request
+# Requires:   nothing — no secrets, no cloud credentials
+# Grants:     contents: read
+#
+# Usage:
+#   jobs:
+#     checkov:
+#       name: "Checkov Terraform"
+#       uses: Muhammad-Irfan324/platform-workflows/.github/workflows/checkov-terraform.yaml@v1
+#       with:
+#         enforcement: "blocking"   # optional, default "blocking"
+######################################################################
+
+name: Checkov Terraform
+
+on:
+  workflow_call:
+    inputs:
+      enforcement:
+        description: blocking (default) fails on findings; report-only reports without blocking
+        required: false
+        type: string
+        default: blocking
+
+permissions:
+  contents: read
+
+jobs:
+  checkov:
+    name: Checkov Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Pure static analysis, nothing created — a superseded scan is just wasted
+    # runner time. No working-directory input, so the ref is the whole key.
+    concurrency:
+      group: checkov-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Validate caller contract
+        shell: bash
+        env:
+          ENFORCEMENT: ${{ inputs.enforcement }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$ENFORCEMENT" != "blocking" && "$ENFORCEMENT" != "report-only" ]]; then
+            echo "::error title=Invalid Checkov enforcement::Use blocking or report-only."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install configuration validator dependencies
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        run: python -m pip install --no-cache-dir pyyaml==6.0.3
+
+      - name: Resolve Checkov policy configuration
+        id: policy
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          record_error() {
+            {
+              echo "conclusion=configuration_error"
+              echo "skip-checks="
+              echo "skip-paths="
+            } >> "$GITHUB_OUTPUT"
+            printf '::error title=%s::%s\n' "$1" "$2"
+            {
+              echo "### Checkov Terraform scan"
+              echo
+              echo "❌ **$1:** $2"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if ! python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          import yaml
+
+          target_directory = Path(os.environ["GITHUB_WORKSPACE"])
+          centrally_excluded_directories = (
+              ".terraform",
+              ".external_modules",
+              "dist",
+              "build",
+              "out",
+              "target",
+              ".cache",
+          )
+          central_skip_path = (
+              r"(^|/)("
+              + "|".join(re.escape(name) for name in centrally_excluded_directories)
+              + r")(/|$)"
+          )
+
+          config_files = [
+              candidate
+              for candidate in (
+                  target_directory / ".checkov.yaml",
+                  target_directory / ".checkov.yml",
+              )
+              if candidate.is_file()
+          ]
+          if len(config_files) > 1:
+              raise SystemExit("Keep only one of .checkov.yaml or .checkov.yml")
+
+          skip_checks: list[str] = []
+          skip_paths: list[str] = []
+
+          if config_files:
+              with config_files[0].open(encoding="utf-8") as config:
+                  data = yaml.safe_load(config) or {}
+
+              if not isinstance(data, dict):
+                  raise SystemExit("Checkov configuration must be a mapping")
+
+              unknown = sorted(set(data) - {"skip-check", "skip-path"})
+              if unknown:
+                  raise SystemExit(
+                      "Only skip-check and skip-path are allowed; found: " + ", ".join(unknown)
+                  )
+
+              def values(key: str) -> list[str]:
+                  value = data.get(key, [])
+                  if isinstance(value, str):
+                      value = [value]
+                  if not isinstance(value, list) or not all(
+                      isinstance(item, str) and item.strip() for item in value
+                  ):
+                      raise SystemExit(f"{key} must be a string or a list of non-empty strings")
+                  return value
+
+              skip_checks = values("skip-check")
+              for check_id in skip_checks:
+                  if not re.fullmatch(r"CKV(?:2)?_[A-Z0-9]+_[0-9]+", check_id):
+                      raise SystemExit(
+                          f"skip-check must contain explicit Checkov policy IDs; invalid: {check_id}"
+                      )
+
+              terraform_sources = [
+                  source.relative_to(target_directory).as_posix()
+                  for source in target_directory.rglob("*.tf")
+                  if set(centrally_excluded_directories).isdisjoint(
+                      source.relative_to(target_directory).parts
+                  )
+              ]
+
+              skip_paths = values("skip-path")
+              for pattern in skip_paths:
+                  if pattern.startswith("/"):
+                      raise SystemExit(f"skip-path must be repository-relative; invalid: {pattern}")
+                  try:
+                      compiled = re.compile(pattern)
+                  except re.error as error:
+                      raise SystemExit(f"invalid skip-path regular expression {pattern}: {error}")
+                  if terraform_sources and all(
+                      compiled.search(source) for source in terraform_sources
+                  ):
+                      raise SystemExit(
+                          f"skip-path cannot exclude every Terraform file; invalid: {pattern}"
+                      )
+
+          combined_skip_path = "|".join(
+              [central_skip_path] + [f"(?:{pattern})" for pattern in skip_paths]
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("conclusion=success\n")
+              output.write("skip-checks=" + ",".join(skip_checks) + "\n")
+              output.write("skip-paths=" + combined_skip_path + "\n")
+          PY
+          then
+            record_error \
+              "Invalid Checkov configuration" \
+              "Repository configuration may contain only narrow skip-check and skip-path exceptions."
+            exit 1
+          fi
+
+      - name: Resolve runner container identity
+        id: runner-identity
+        if: steps.policy.outcome == 'success'
+        shell: bash
+        run: echo "container-user=$(id -u):$(id -g)" >> "$GITHUB_OUTPUT"
+
+      - name: Run Checkov
+        id: scan
+        if: steps.policy.outcome == 'success'
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@5659ddea96102e16d8f221b3d8402453c0b1c150  # v12.3121.0
+        with:
+          directory: .
+          framework: terraform
+          skip_check: ${{ steps.policy.outputs['skip-checks'] }}
+          skip_path: ${{ steps.policy.outputs['skip-paths'] }}
+          download_external_modules: false
+          skip_download: true
+          skip_results_upload: true
+          quiet: true
+          compact: true
+          output_format: json
+          output_file_path: checkov-results
+          container_user: ${{ steps['runner-identity'].outputs['container-user'] }}
+
+      - name: Report Checkov result
+        id: report
+        if: steps.policy.outcome == 'success'
+        shell: bash
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+        run: |
+          set -uo pipefail
+          CHECKOV_SCAN_OUTCOME="$SCAN_OUTCOME" python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          summary_path = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          scan_outcome = os.environ["CHECKOV_SCAN_OUTCOME"]
+          results_directory = workspace / "checkov-results"
+          results_path = results_directory / "results_json.json"
+
+          def set_output(name: str, value: str) -> None:
+              with output_path.open("a", encoding="utf-8") as output:
+                  output.write(f"{name}={value}\n")
+
+          def append_summary(lines: list[str]) -> None:
+              with summary_path.open("a", encoding="utf-8") as summary:
+                  summary.write("\n".join(lines) + "\n")
+
+          def workflow_escape(value: str, *, property_value: bool = False) -> str:
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              if property_value:
+                  escaped = escaped.replace(":", "%3A").replace(",", "%2C")
+              return escaped
+
+          def fail_scanner(message: str) -> None:
+              set_output("conclusion", "scanner_error")
+              set_output("failed-check-ids", "")
+              print(f"::error title=Checkov scanner error::{workflow_escape(message)}")
+              append_summary(["### Checkov Terraform scan", "", f"❌ **Scanner error:** {message}"])
+              raise SystemExit(0)
+
+          if not results_path.is_file():
+              candidates = sorted(results_directory.glob("*.json")) if results_directory.is_dir() else []
+              if not candidates:
+                  fail_scanner("Checkov did not produce a JSON result.")
+              results_path = candidates[0]
+
+          try:
+              raw_reports = json.loads(results_path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as error:
+              fail_scanner(f"Checkov produced an unreadable JSON result: {error}")
+
+          reports = raw_reports if isinstance(raw_reports, list) else [raw_reports]
+          failed_checks: list[dict] = []
+          parsing_errors: list[str] = []
+          parsing_error_count = 0
+          passed_count = 0
+          skipped_count = 0
+          for report in reports:
+              if not isinstance(report, dict):
+                  fail_scanner("Checkov returned an unexpected result structure.")
+              results = report.get("results") or {}
+              summary = report.get("summary") or {}
+              failed_checks.extend(results.get("failed_checks") or [])
+              report_parsing_errors = [str(error) for error in (results.get("parsing_errors") or [])]
+              parsing_errors.extend(report_parsing_errors)
+              parsing_error_count += max(
+                  len(report_parsing_errors), int(summary.get("parsing_errors") or 0)
+              )
+              passed_count += int(summary.get("passed") or 0)
+              skipped_count += int(summary.get("skipped") or 0)
+
+          if parsing_error_count:
+              if parsing_errors:
+                  preview = ", ".join(parsing_errors[:3])
+                  if len(parsing_errors) > 3:
+                      preview += f" and {len(parsing_errors) - 3} more"
+              else:
+                  preview = f"{parsing_error_count} Terraform file(s)"
+              fail_scanner(f"Terraform parsing failed for: {preview}")
+
+          set_output(
+              "failed-check-ids",
+              ",".join(sorted({str(check.get("check_id") or "unknown") for check in failed_checks})),
+          )
+
+          if failed_checks:
+              set_output("conclusion", "policy_failure")
+              summary_lines = [
+                  "### Checkov Terraform scan",
+                  "",
+                  f"❌ **{len(failed_checks)} unsuppressed policy finding(s)**",
+                  "",
+                  "| Check | Resource | File | Guidance |",
+                  "| --- | --- | --- | --- |",
+              ]
+              for check in failed_checks[:50]:
+                  check_id = str(check.get("check_id") or "unknown")
+                  check_name = str(check.get("check_name") or "Checkov policy failed")
+                  resource = str(check.get("resource") or "unknown")
+                  guideline = str(check.get("guideline") or "")
+                  annotation_file = str(
+                      check.get("repo_file_path") or check.get("file_path") or "unknown"
+                  ).lstrip("/")
+                  line_range = check.get("file_line_range") or [1, 1]
+                  start_line = int(line_range[0]) if line_range else 1
+                  end_line = int(line_range[-1]) if line_range else start_line
+                  annotation_message = f"{check_name}; resource: {resource}"
+                  if guideline:
+                      annotation_message += f"; guidance: {guideline}"
+                  print(
+                      "::error "
+                      f"file={workflow_escape(annotation_file, property_value=True)},"
+                      f"line={start_line},endLine={end_line},"
+                      f"title={workflow_escape(check_id, property_value=True)}::"
+                      f"{workflow_escape(annotation_message)}"
+                  )
+                  summary_lines.append(
+                      f"| {check_id} | {resource.replace('|', '\\|')} "
+                      f"| {annotation_file.replace('|', '\\|')}:{start_line} "
+                      f"| {f'[Link]({guideline})' if guideline else '—'} |"
+                  )
+              if len(failed_checks) > 50:
+                  summary_lines.extend(["", f"_Showing 50 of {len(failed_checks)} findings._"])
+              append_summary(summary_lines)
+              raise SystemExit(0)
+
+          if scan_outcome != "success":
+              fail_scanner("Checkov failed without reporting any policy finding.")
+
+          set_output("conclusion", "success")
+          append_summary(
+              [
+                  "### Checkov Terraform scan",
+                  "",
+                  f"✅ Passed {passed_count} checks; {skipped_count} checks were explicitly suppressed.",
+              ]
+          )
+          PY
+          report_status=$?
+          # The Docker action creates the output directory as root before
+          # running Checkov as the configured container user.
+          sudo rm -rf -- "$GITHUB_WORKSPACE/checkov-results"
+          exit "$report_status"
+
+      - name: Enforce Checkov result
+        if: always()
+        shell: bash
+        env:
+          ENFORCEMENT: ${{ inputs.enforcement }}
+          CONCLUSION: ${{ steps.policy.outputs.conclusion == 'configuration_error' && 'configuration_error' || steps.report.outputs.conclusion }}
+          FAILED_CHECK_IDS: ${{ steps.report.outputs.failed-check-ids }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$ENFORCEMENT" == "report-only" ]]; then
+            if [[ "$CONCLUSION" != "success" ]]; then
+              echo "::warning title=Checkov report-only::Findings were reported but do not block this pull request (${CONCLUSION:-unknown})."
+              {
+                echo
+                echo "> ⚠️ Report-only mode: the findings above do not block this pull request."
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+
+          case "$CONCLUSION" in
+            success)
+              ;;
+            policy_failure)
+              echo "Checkov reported unsuppressed findings: ${FAILED_CHECK_IDS:-unknown}." >&2
+              exit 1
+              ;;
+            configuration_error)
+              echo "The repository Checkov configuration was rejected." >&2
+              exit 1
+              ;;
+            scanner_error)
+              echo "Checkov could not complete a trustworthy scan." >&2
+              exit 1
+              ;;
+            *)
+              echo "The Checkov scan did not report a conclusion." >&2
+              exit 1
+              ;;
+          esac

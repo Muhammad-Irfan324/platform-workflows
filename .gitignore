@@ -1,0 +1,8 @@
+# Written by @semantic-release/exec so the release workflow can read the
+# version back; never committed.
+.release-version
+
+# Transient checkout of this repository made by reusable workflows.
+.platform-workflows/
+
+node_modules/

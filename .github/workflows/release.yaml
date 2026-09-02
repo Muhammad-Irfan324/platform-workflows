@@ -1,0 +1,201 @@
+---
+######################################################################
+# Release — platform-workflows
+######################################################################
+#
+# Versions THIS repository so consuming repos can pin to a tag instead
+# of @main. Runs semantic-release on push to main, then force-moves the
+# major tag (v1) to the new release — the same pattern actions/checkout
+# uses.
+#
+# Consumers should reference:
+#
+#   uses: Muhammad-Irfan324/platform-workflows/.github/workflows/x.yaml@v1
+#
+# which auto-updates within the major version, exactly like @main did,
+# but gives a rollback path and a migration window for breaking changes.
+#
+# Same bump rules as the module repos, from the same shared config:
+#
+#   fix:                        → patch   (v1.0.0 → v1.0.1)
+#   feat:                       → minor   (v1.0.0 → v1.1.0)
+#   feat!:  (or any type + !)   → major   (v1.0.0 → v2.0.0)
+#   BREAKING CHANGE: footer     → major   (v1.0.0 → v2.0.0)
+#   anything else               → no release
+#
+# `!` and the BREAKING CHANGE footer are one rule in two notations.
+#
+# "anything else" is about the SUBJECT only. A breaking marker forces a
+# major whatever the type says, so a chore:-titled commit carrying a
+# BREAKING CHANGE footer still cuts one — it is not a safe no-op.
+#
+# Every commit counts, not just the pull request title: this org squashes
+# with COMMIT_MESSAGES, so the squashed body is every commit message in
+# the PR concatenated and semantic-release reads all of it.
+#
+# Called by:  this repository only, on push to main
+# Requires:   nothing beyond the default GITHUB_TOKEN
+# Grants:     contents: write (job level only)
+######################################################################
+
+name: "Release"
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: "Semantic Release"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # @semantic-release/github's `success` step posts "included in release"
+    # comments on the pull requests and issues that shipped, which needs
+    # issues: write and pull-requests: write. With contents: write alone it
+    # fails "Resource not accessible by integration" — AFTER the tag and the
+    # GitHub release have already been published. v1.0.0 shipped exactly that
+    # way on 2026-08-31: released successfully, job red, major tag skipped.
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history needed for semantic-release to determine version bumps
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load central versions
+        uses: ./actions/load-tool-versions
+
+      # Renders configs/.releaserc.json — the same base module repos get —
+      # minus the changelog and git plugins. This repo is versioned by tag
+      # only; it does not carry a CHANGELOG or push commits to main.
+      - name: Render release config
+        run: |
+          set -euo pipefail
+
+          jq '.plugins |= map(
+                if type == "array"
+                   and (.[0] == "@semantic-release/changelog"
+                        or .[0] == "@semantic-release/git")
+                then empty
+                else .
+                end)' \
+            configs/.releaserc.json > .releaserc.json
+
+          echo "Plugins enabled:"
+          jq -r '.plugins[] | if type == "array" then .[0] else . end' .releaserc.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Run semantic-release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Versions come from configs/package.json, not from a list typed
+          # here. Dependabot cannot see a package name inside a shell
+          # command, so pins written here aged silently — six of eight had
+          # drifted, one by a whole major. In a real package.json its npm
+          # ecosystem watches and bumps them.
+          mapfile -t DEPS < <(
+            jq -r '.devDependencies | to_entries[] | "\(.key)@\(.value)"' \
+              configs/package.json
+          )
+          echo "Installing: ${DEPS[*]}"
+          npm install --no-save "${DEPS[@]}"
+
+          # No `|| true` — a semantic-release failure must fail the job.
+          npx semantic-release
+
+          # semantic-release writes the released version to this file via
+          # the exec plugin; absent means no release was triggered.
+          if [ -f .release-version ]; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "version=$(cat .release-version)" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Move major tag
+        id: major_tag
+        # always(), because `released` being true means the tag and the GitHub
+        # release are already published — the moving major tag is part of that
+        # release, not a reward for the whole step having gone green. Keyed on
+        # the step's success, a failure in a LATER, cosmetic part of
+        # semantic-release skipped this and left v1 pointing nowhere while
+        # v1.0.0 existed, which is the one state consumers cannot survive:
+        # every repo pinning @v1 resolves nothing.
+        if: always() && steps.semantic.outputs.released == 'true'
+        env:
+          VERSION: ${{ steps.semantic.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          MAJOR="v${VERSION%%.*}"
+          echo "Moving ${MAJOR} to v${VERSION}"
+
+          SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}" --jq '.object.sha')
+
+          # Create the major tag, or move it if it already exists.
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${MAJOR}" -f sha="${SHA}" 2>/dev/null \
+          || gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${MAJOR}" \
+               -f sha="${SHA}" -F force=true
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          # Three outcomes, not two. `released` is empty both when there was
+          # nothing to release AND when semantic-release failed, so keying on
+          # it alone reported an auth error, a plugin error or a rejected
+          # @semantic-release/git push as "no relevant commits" — the one
+          # message that means "nothing is wrong". Check outcome first.
+          {
+            echo "### Release"
+            echo ""
+            if [ "${{ steps.semantic.outcome }}" != "success" ]; then
+              echo "❌ Release failed — semantic-release did not complete. No tag was"
+              echo "moved. See the step log; this is not a no-op."
+            elif [ "${{ steps.semantic.outputs.released }}" = "true" ]; then
+              MAJOR="v$(echo "${{ steps.semantic.outputs.version }}" | cut -d. -f1)"
+              echo "✅ Released \`v${{ steps.semantic.outputs.version }}\`"
+              echo ""
+              # The tag move is a SEPARATE step and can fail on its own — a
+              # token without contents:write on tags, a ruleset protecting
+              # them, an API error. Keying this line on `released` alone
+              # announced a moved tag whenever semantic-release succeeded,
+              # which is the failure that matters most here: consumers on @v1
+              # would still be running the previous version while the summary
+              # said otherwise. Same bug as the one fixed above, one step later.
+              case "${{ steps.major_tag.outcome }}" in
+                success)
+                  echo "Major tag \`${MAJOR}\` now points here."
+                  ;;
+                *)
+                  echo "⚠️ **\`${MAJOR}\` was NOT moved** — the release is published but"
+                  echo "every repo on \`@${MAJOR}\` is still on the previous version."
+                  echo "Move it by hand, or re-run this job once the cause is fixed."
+                  ;;
+              esac
+            else
+              echo "⬜ No release — no relevant commits since the last version."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

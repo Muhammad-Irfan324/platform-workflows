@@ -1,0 +1,101 @@
+---
+######################################################################
+# Load Tool Versions
+######################################################################
+#
+# Reads versions.env from THIS repository and exports every entry to
+# the job environment, so later steps can use $TFLINT_VERSION,
+# $TERRAFORM_DOCS_VERSION, $NODE_VERSION and so on.
+#
+# That is all it does. It does NOT install Terraform: Terraform's
+# version belongs to the calling repository's state, so it is passed as
+# a workflow input and installed with hashicorp/setup-terraform
+# directly. Wrapping that here would only have hidden where the version
+# comes from.
+#
+# Two call sites, two different paths:
+#
+# 1. From a workflow in THIS repository (ci.yaml, release.yaml), the
+#    workspace already is platform-workflows:
+#
+#      - uses: ./actions/load-tool-versions
+#
+# 2. From a REUSABLE workflow running in another repo, `./` resolves
+#    against the CALLER's checkout, so platform-workflows must be fetched
+#    first and the action referenced through that path:
+#
+#      - uses: actions/checkout@<sha>
+#        with:
+#          repository: Muhammad-Irfan324/platform-workflows
+#          ref: ${{ inputs.workflows-ref }}
+#          path: .platform-workflows
+#          sparse-checkout: |
+#            versions.env
+#            actions
+#          token: ${{ secrets.AUTOMATION_PAT }}
+#          persist-credentials: false
+#
+#      - uses: ./.platform-workflows/actions/load-tool-versions
+#
+#    The checkout path must sit inside $GITHUB_WORKSPACE, and `ref` is
+#    NOT optional. Omitted, it resolves to the default branch, so a caller
+#    pinned to @v1 would read main's versions.env. A reusable workflow
+#    cannot discover its own ref, so each one takes it as the
+#    `workflows-ref` input.
+######################################################################
+
+name: "Load Tool Versions"
+description: "Export the centrally pinned CI tool versions from versions.env"
+
+runs:
+  using: composite
+  steps:
+    - name: Load central versions
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        VERSIONS_FILE="${GITHUB_ACTION_PATH}/../../versions.env"
+
+        if [ ! -f "$VERSIONS_FILE" ]; then
+          echo "::error title=Missing versions.env::Expected central versions file at $VERSIONS_FILE"
+          exit 1
+        fi
+
+        # Read whole lines, not KEY=VALUE pairs. Splitting on '=' up front
+        # meant "  # note" was never recognised as a comment — the leading
+        # spaces kept it from matching '#*' — so the entire line was written
+        # to GITHUB_ENV as a variable name and the runner rejected it,
+        # failing this step in every calling repo. The trim happens first
+        # now, and anything that still is not a clean KEY=VALUE is refused
+        # here rather than handed to the runner as garbage.
+        #
+        # `|| [ -n "$line" ]` keeps a final line with no trailing newline.
+        while IFS= read -r line || [ -n "$line" ]; do
+          line="${line%$'\r'}"                        # tolerate CRLF
+          line="${line#"${line%%[![:space:]]*}"}"     # strip leading space
+
+          case "$line" in
+            ''|'#'*) continue ;;
+          esac
+
+          key="${line%%=*}"
+          value="${line#*=}"
+
+          if [ "$key" = "$line" ]; then
+            echo "::error title=Malformed versions.env line::Expected KEY=VALUE, got '$line'"
+            exit 1
+          fi
+
+          case "$key" in
+            ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
+              echo "::error title=Invalid versions.env key::'$key' is not a valid environment variable name."
+              exit 1
+              ;;
+          esac
+
+          printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+          echo "  $key=$value"
+        done < "$VERSIONS_FILE"
+
+        echo "Loaded CI tool versions from versions.env"

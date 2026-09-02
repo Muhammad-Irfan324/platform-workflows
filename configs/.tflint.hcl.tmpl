@@ -1,0 +1,28 @@
+######################################################################
+# Default TFLint configuration for Terraform modules
+######################################################################
+#
+# terraform-module-ci renders this into a module repo that does not
+# provide its own .tflint.hcl. A committed file in the module repo
+# always wins.
+#
+# __TFLINT_AWS_RULESET_VERSION__ is substituted from versions.env at
+# copy time, so the ruleset version has exactly one home. This is a
+# .tmpl precisely so nobody mistakes it for a runnable config — the
+# rendered file lands in the module repo as .tflint.hcl.
+#
+# To render it locally:
+#   . versions.env && sed "s|__TFLINT_AWS_RULESET_VERSION__|$TFLINT_AWS_RULESET_VERSION|" \
+#     configs/.tflint.hcl.tmpl > .tflint.hcl
+######################################################################
+
+plugin "terraform" {
+  enabled = true
+  preset  = "recommended"
+}
+
+plugin "aws" {
+  enabled = true
+  version = "__TFLINT_AWS_RULESET_VERSION__"
+  source  = "github.com/terraform-linters/tflint-ruleset-aws"
+}

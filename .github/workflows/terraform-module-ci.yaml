@@ -1,0 +1,442 @@
+---
+######################################################################
+# Reusable Terraform Module CI
+######################################################################
+#
+# Validates a Terraform module on every pull request. Runs seven checks
+# in order, each reporting into a summary table:
+#
+#   fmt · init · validate · tflint
+#   terraform-docs · examples · terraform test
+#
+# Default .tflint.hcl and .terraform-docs.yaml are copied from this
+# repository's configs/ when the calling repo does not provide its own,
+# so module repos carry no lint boilerplate. A committed file wins.
+#
+# Checkov is deliberately NOT run here — add checkov-terraform.yaml as a
+# separate job in the same caller file. See the README.
+#
+# Called by:  module repos (terraform-*), on pull_request
+# Requires:   AUTOMATION_PAT for private module sources
+# Grants:     contents: read
+#
+# Usage:
+#   jobs:
+#     module_ci:
+#       name: "Module CI"
+#       uses: Muhammad-Irfan324/platform-workflows/.github/workflows/terraform-module-ci.yaml@v1
+#       with:
+#         working-directory: "."
+#       secrets:
+#         AUTOMATION_PAT: ${{ secrets.AUTOMATION_PAT }}
+######################################################################
+
+name: "Reusable Terraform Module CI"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Path to the Terraform module root directory"
+        required: false
+        type: string
+        default: "."
+      terraform-version:
+        description: >-
+          Terraform version used to validate and test the module. Defaults
+          to the version deployments actually run, so a module cannot pass
+          CI using a feature the infra repo's Terraform does not have.
+        required: false
+        type: string
+        default: "~1.15.9"
+      terraform-docs-check:
+        description: "Whether to verify README is up to date with terraform-docs"
+        required: false
+        type: boolean
+        default: true
+      validate-examples:
+        description: "Whether to validate examples/ directories"
+        required: false
+        type: boolean
+        default: true
+      require-tests:
+        description: >-
+          Fail when the module has no .tftest.hcl files. Leave false while a
+          module has no tests; turn it on once it does, so deleting the test
+          file cannot silently drop coverage behind a green check.
+        required: false
+        type: boolean
+        default: false
+      workflows-ref:
+        description: >-
+          Ref of platform-workflows to read versions.env and configs/ from.
+          A reusable workflow cannot discover its own ref — GitHub exposes
+          only the CALLER's via github.workflow_ref — so this cannot be
+          derived and must be stated. Left unset, the checkout below would
+          silently track the default branch, and a caller on @v1 would run
+          v1's logic against main's tool versions. Pin it to the same tag
+          as your `uses:` line when configs and logic must move together.
+        required: false
+        type: string
+        default: "v1"
+    secrets:
+      AUTOMATION_PAT:
+        description: "PAT for accessing private Terraform modules referenced in examples"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  module_ci:
+    name: "Terraform Module CI"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Cancelling is right here, as it is for plan: nothing is created, and a
+    # second push to the same pull request makes the running check obsolete.
+    # Keyed on working-directory too, so a caller running this twice for two
+    # modules in one repo does not have one run cancel the other.
+    concurrency:
+      group: module-ci-${{ github.repository }}-${{ github.ref }}-${{ inputs.working-directory }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      # ── Checkout & Setup ──────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          # Disable wrapper to prevent stdout/stderr interference with piping
+          terraform_wrapper: false
+
+      - name: Configure private module access
+        env:
+          TOKEN: ${{ secrets.AUTOMATION_PAT }}
+        run: |
+          # Scoped to the org path so the token is not transmitted on
+          # public module and provider fetches.
+          git config --global \
+            url."https://${TOKEN}:x-oauth-basic@github.com/Muhammad-Irfan324/".insteadOf \
+            "https://github.com/Muhammad-Irfan324/"
+
+      # ── Central configs and tool versions ────────────────────────────
+      # `./` in a reusable workflow resolves against the CALLER's
+      # checkout, so platform-workflows must be fetched to reach its own
+      # configs/ and actions/.
+      - name: Fetch central configs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Muhammad-Irfan324/platform-workflows
+          ref: ${{ inputs.workflows-ref }}
+          path: .platform-workflows
+          sparse-checkout: |
+            versions.env
+            actions
+            configs
+          token: ${{ secrets.AUTOMATION_PAT }}
+          persist-credentials: false
+
+      - name: Load central tool versions
+        uses: ./.platform-workflows/actions/load-tool-versions
+
+      # Copied from real files in platform-workflows/configs rather than
+      # generated from a heredoc, so the defaults are diffable, lintable
+      # and reproducible locally. A committed file in the module repo
+      # always wins.
+      - name: Apply default configs
+        run: |
+          set -euo pipefail
+
+          CONFIGS="${GITHUB_WORKSPACE}/.platform-workflows/configs"
+
+          if [ -f ".tflint.hcl" ]; then
+            echo "Using this repository's own .tflint.hcl."
+          else
+            # The ruleset version comes from versions.env, so it has one
+            # home rather than being duplicated in the config file.
+            sed "s|__TFLINT_AWS_RULESET_VERSION__|${TFLINT_AWS_RULESET_VERSION}|" \
+              "${CONFIGS}/.tflint.hcl.tmpl" > .tflint.hcl
+
+            if grep -q '__TFLINT_AWS_RULESET_VERSION__' .tflint.hcl; then
+              echo "::error title=Unrendered template::TFLINT_AWS_RULESET_VERSION was not substituted."
+              exit 1
+            fi
+            echo "No .tflint.hcl found — rendered the central default."
+          fi
+
+          # Both spellings. terraform-docs discovers .yaml and .yml alike and
+          # prefers .yaml when both are present, so testing only .yml told a
+          # repo that had committed .yaml its config was missing, then wrote
+          # the central default in beside it — a stray file and a false log
+          # line, and one terraform-docs precedence change away from silently
+          # overriding the repo's own choice.
+          if [ -f ".terraform-docs.yml" ] || [ -f ".terraform-docs.yaml" ]; then
+            echo "Using this repository's own terraform-docs config."
+          else
+            cp "${CONFIGS}/.terraform-docs.yaml" .terraform-docs.yaml
+            echo "No terraform-docs config found — applied the central default."
+          fi
+
+          # Removed once the configs are in place. Left behind it would be
+          # walked by terraform fmt -recursive, tflint --recursive and the
+          # examples scan, all of which run from the repository root.
+          rm -rf "${GITHUB_WORKSPACE}/.platform-workflows"
+
+      # ── Terraform Core Checks ────────────────────────────────────────
+      - name: Terraform Format Check
+        id: fmt
+        run: |
+          if terraform fmt -check -recursive -diff; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Terraform files are not formatted. Run 'terraform fmt -recursive' and commit the result."
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Terraform Init
+        id: init
+        run: |
+          if terraform init -backend=false; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          if terraform validate -no-color; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # ── Linting ──────────────────────────────────────────────────────
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a  # v6.3.0
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      # The AWS ruleset is downloaded from the GitHub releases API on every
+      # run. Unauthenticated calls are rate-limited per IP and hosted runners
+      # share IPs, so this failed intermittently across every module repo for
+      # reasons having nothing to do with the module under test.
+      #
+      # The cache usually avoids the call entirely; the token raises the limit
+      # for the times it does not. Keyed on both versions, so bumping either
+      # in versions.env invalidates the cache rather than pinning a stale
+      # plugin. secrets.GITHUB_TOKEN needs no declaration — it is the caller's
+      # token and is always present.
+      - name: Cache TFLint plugins
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.tflint.d/plugins
+          key: tflint-${{ runner.os }}-${{ env.TFLINT_VERSION }}-${{ env.TFLINT_AWS_RULESET_VERSION }}
+
+      - name: Init TFLint Plugins
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: tflint --init
+
+      - name: Run TFLint
+        id: tflint
+        run: |
+          # --config with an absolute path is required. In recursive mode
+          # TFLint looks for .tflint.hcl in EACH directory it enters, so
+          # without this the AWS ruleset silently does not load under
+          # examples/ — verified: examples/ loaded only the bundled
+          # terraform ruleset, while the root loaded ruleset.aws too.
+          if tflint --recursive --config="${PWD}/.tflint.hcl"; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # ── Security Scanning ────────────────────────────────────────────
+      # Checkov is NOT run here. Module repos call checkov-terraform.yaml
+      # as its own job, which validates .checkov.yaml against a strict
+      # schema, emits per-finding annotations and supports enforcement
+      # modes. Running it inline as well meant two scans per PR under two
+      # different configurations, able to disagree on the same commit.
+      #
+      # See the Checkov section of this repository's README for the
+      # caller job to add alongside this one.
+
+      # ── Documentation ────────────────────────────────────────────────
+      - name: Install terraform-docs
+        if: ${{ inputs.terraform-docs-check }}
+        run: |
+          set -euo pipefail
+          # -f so a 404 or 5xx fails here, not later with a confusing tar error.
+          curl -fsSLo terraform-docs.tar.gz \
+            "https://github.com/terraform-docs/terraform-docs/releases/download/${TERRAFORM_DOCS_VERSION}/terraform-docs-${TERRAFORM_DOCS_VERSION}-linux-amd64.tar.gz"
+
+          # Verified before extraction. This step runs in EVERY module repo,
+          # so an unverified binary here executes with the caller's token in
+          # scope across the whole estate. The digest lives beside the version
+          # in versions.env; a mismatch means the asset is not what was pinned.
+          echo "${TERRAFORM_DOCS_SHA256}  terraform-docs.tar.gz" | sha256sum -c -
+
+          tar xzf terraform-docs.tar.gz terraform-docs
+          chmod +x terraform-docs
+          sudo mv terraform-docs /usr/local/bin/
+          # The tarball lands in the module's working directory; left behind it
+          # is untracked junk sitting in the repo the later checks scan.
+          rm -f terraform-docs.tar.gz
+
+      - name: Verify README is up to date
+        id: tfdocs
+        if: ${{ inputs.terraform-docs-check }}
+        run: |
+          set -euo pipefail
+
+          # No formatter or output flags: terraform-docs reads
+          # its terraform-docs config from this directory — the module's own if it
+          # committed one, otherwise the central default copied in above.
+          # Passing the flags explicitly overrode that config's formatter and
+          # output sections, so a module repo choosing its own format was
+          # silently ignored despite "a committed file always wins".
+          # Checked BEFORE generating, and against the index rather than the
+          # filesystem. `git diff` reports on TRACKED files only, so a module
+          # with no committed README.md produced an empty diff and passed —
+          # terraform-docs had just written the file itself a moment earlier,
+          # and the check then compared it against nothing. A green tick from
+          # the one step whose entire job is verifying that file exists and
+          # is current.
+          if ! git ls-files --error-unmatch README.md >/dev/null 2>&1; then
+            echo "::error title=No committed README.md::This module has no README.md tracked in git. Run 'terraform-docs .' and commit the result."
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          terraform-docs .
+
+          if git diff --exit-code README.md; then
+            echo "result=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::README.md is out of date. Run 'terraform-docs .' in the module directory and commit the result."
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # ── Examples Validation ──────────────────────────────────────────
+      - name: Validate Examples
+        id: examples
+        if: ${{ inputs.validate-examples }}
+        run: |
+          # VALIDATED counts what was actually checked. Reporting on the
+          # existence of examples/ alone meant an empty directory — or one
+          # whose subdirectories have no main.tf — rendered ✅ Pass in the
+          # summary table for zero work done. "Pass" has to mean something
+          # ran; nothing to check is a skip.
+          if [ -d "examples" ]; then
+            FAILED=0
+            VALIDATED=0
+            for example_dir in examples/*/; do
+              if [ -f "${example_dir}main.tf" ]; then
+                VALIDATED=$((VALIDATED + 1))
+                echo "::group::Validating ${example_dir}"
+                if ! terraform -chdir="${example_dir}" init -backend=false || ! terraform -chdir="${example_dir}" validate -no-color; then
+                  FAILED=1
+                fi
+                echo "::endgroup::"
+              fi
+            done
+            if [ "$FAILED" -eq 1 ]; then
+              echo "result=fail" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            if [ "$VALIDATED" -eq 0 ]; then
+              echo "result=skip" >> "$GITHUB_OUTPUT"
+              echo "examples/ contains no directory with a main.tf — nothing to validate."
+            else
+              echo "result=pass" >> "$GITHUB_OUTPUT"
+              echo "Validated ${VALIDATED} example(s)."
+            fi
+          else
+            echo "result=skip" >> "$GITHUB_OUTPUT"
+            echo "No examples/ directory found — skipping."
+          fi
+
+      # ── Terraform Test ───────────────────────────────────────────────
+      # Runs terraform test if .tftest.hcl files exist in the module root
+      # or tests/ directory. Skips gracefully when no tests are present.
+      # This belongs in module CI only — deployment repos consume
+      # already-tested, versioned modules via terraform plan/apply.
+      #
+      # No real infrastructure is created, by three separate layers:
+      #
+      #   1. Module tests declare mock_provider "aws", so the provider is
+      #      never contacted and no credentials are needed at all.
+      #   2. Their run blocks set `command = plan` explicitly. A run block
+      #      defaults to `command = apply`; nothing here enforces plan.
+      #   3. This job holds no AWS credentials — contents: read only, no
+      #      id-token: write, no configure-aws-credentials step — so an
+      #      UNMOCKED apply-mode test fails at provider authentication
+      #      rather than building anything.
+      #
+      # 1 and 2 are the design and live in the module repo; see
+      # terraform-ecr/tests/defaults.tftest.hcl. 3 is the backstop here,
+      # and it is the only one this workflow controls. Keep it: granting
+      # this job credentials would leave an unmocked `command = apply`
+      # test free to create real infrastructure on a pull request.
+      - name: Terraform Test
+        id: tftest
+        run: |
+          if compgen -G "*.tftest.hcl" > /dev/null 2>&1 || compgen -G "tests/*.tftest.hcl" > /dev/null 2>&1; then
+            echo "::group::Running terraform test"
+            if terraform test; then
+              echo "result=pass" >> "$GITHUB_OUTPUT"
+            else
+              echo "result=fail" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            echo "::endgroup::"
+          elif [ "${{ inputs.require-tests }}" = "true" ]; then
+            echo "::error title=No tests::require-tests is on but this module has no .tftest.hcl files."
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "result=skip" >> "$GITHUB_OUTPUT"
+            echo "No .tftest.hcl files found — skipping terraform test."
+          fi
+
+      # ── Summary ──────────────────────────────────────────────────────
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          status() {
+            case "$1" in
+              pass) echo "✅ Pass" ;;
+              fail) echo "❌ Fail" ;;
+              skip) echo "⏭️ Skip" ;;
+              *)    echo "⬜ N/A"  ;;
+            esac
+          }
+          {
+            echo "### Terraform Module CI"
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Format (\`terraform fmt\`) | $(status '${{ steps.fmt.outputs.result }}') |"
+            echo "| Init | $(status '${{ steps.init.outputs.result }}') |"
+            echo "| Validate | $(status '${{ steps.validate.outputs.result }}') |"
+            echo "| TFLint | $(status '${{ steps.tflint.outputs.result }}') |"
+            echo "| terraform-docs | $(status '${{ steps.tfdocs.outputs.result }}') |"
+            echo "| Examples | $(status '${{ steps.examples.outputs.result }}') |"
+            echo "| Terraform Test | $(status '${{ steps.tftest.outputs.result }}') |"
+          } >> "$GITHUB_STEP_SUMMARY"

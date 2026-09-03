@@ -16,7 +16,7 @@
 # for ArgoCD deployment.
 #
 # Called by:  application repos, on pull_request and push to main
-# Requires:   SONAR_TOKEN for SonarQube (token only — host URL is an input);
+# Requires:   SONAR_TOKEN + SONAR_HOST_URL for SonarQube;
 #             REGISTRY_USER + REGISTRY_TOKEN for GitLab CR push
 #               (use a GitLab Deploy Token or Project Access Token,
 #                scoped to read_registry + write_registry — never a
@@ -36,9 +36,9 @@
 #         docker-context: "."
 #         registry-url: "registry.gitlab.com"
 #         image-name: "my-group/my-service"
-#         sonar-host-url: ${{ vars.SONAR_HOST_URL }}   # GitHub Variable, not a secret
 #       secrets:
 #         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+#         SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 #         REGISTRY_USER: ${{ secrets.REGISTRY_USER }}   # GitLab Deploy Token name
 #         REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }} # GitLab Deploy Token value
 ######################################################################
@@ -98,14 +98,12 @@ on:
         required: false
         type: boolean
         default: false
-      sonar-host-url:
-        description: "SonarQube server URL (not a secret — use GitHub Variables: vars.SONAR_HOST_URL)"
-        required: false
-        type: string
-        default: ""
     secrets:
       SONAR_TOKEN:
         description: "SonarQube authentication token (project-scoped analysis token)"
+        required: false
+      SONAR_HOST_URL:
+        description: "SonarQube server URL"
         required: false
       REGISTRY_USER:
         description: "GitLab Deploy Token name (or project/group access token username)"
@@ -222,7 +220,7 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f  # v8.2.1
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ inputs.sonar-host-url }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
           projectBaseDir: ${{ inputs.working-directory }}
           args: >

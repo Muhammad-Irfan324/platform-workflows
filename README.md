@@ -507,10 +507,10 @@ jobs:
       registry-url: "registry.gitlab.com"
       image-name: "my-group/my-service"
       sonar-project-key: "my-service"
-      sonar-host-url: ${{ vars.SONAR_HOST_URL }}       # GitHub Variable, not a secret
       push-image: ${{ github.ref == 'refs/heads/main' }}
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
       REGISTRY_USER: ${{ secrets.REGISTRY_USER }}       # GitLab Deploy Token name
       REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}     # GitLab Deploy Token value
 ```
@@ -618,6 +618,6 @@ Before opening a pull request:
 - Branch protection requiring these checks, or results are informational only. Best set as
   an org ruleset targeting `terraform-*` so it covers every module repo at once.
 - **Application repos** — `SONAR_TOKEN` (project-scoped analysis token from SonarQube);
-  `SONAR_HOST_URL` as a GitHub Variable (`vars.`, not a secret — it is a URL, not a credential);
+  `SONAR_HOST_URL` (SonarQube server URL, passed as a secret);
   `REGISTRY_USER` and `REGISTRY_TOKEN` (a GitLab Deploy Token scoped to
   `read_registry` + `write_registry`, not a personal password).

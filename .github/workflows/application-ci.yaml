@@ -11,9 +11,10 @@
 #   Docker build · Trivy (container scan → SARIF to Security tab)
 #   Push with SLSA provenance attestation + SBOM
 #
-# On merge to main the pipeline additionally pushes the image to the
-# GitLab Container Registry and optionally updates a GitOps manifest
-# for ArgoCD deployment.
+# On merge to main the caller should set skip-checks: true so only
+# the Docker build, scan, and push run (checks already passed on the
+# PR). The pipeline pushes the image to the GitLab Container Registry
+# and optionally updates a GitOps manifest for ArgoCD deployment.
 #
 # Called by:  application repos, on pull_request and push to main
 # Requires:   SONAR_TOKEN + SONAR_HOST_URL for SonarQube;
@@ -98,6 +99,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip-checks:
+        description: "Skip lint, test, and security jobs (use on merge to main when checks already passed on PR)"
+        required: false
+        type: boolean
+        default: false
     secrets:
       SONAR_TOKEN:
         description: "SonarQube authentication token (project-scoped analysis token)"
@@ -121,6 +127,7 @@ permissions:
 jobs:
   lint-and-test:
     name: "Lint & Test"
+    if: ${{ !inputs.skip-checks }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
@@ -185,6 +192,7 @@ jobs:
 
   security-scan:
     name: "Security Scan"
+    if: ${{ !inputs.skip-checks }}
     needs: [lint-and-test]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -279,6 +287,7 @@ jobs:
 
   docker-build-scan:
     name: "Docker Build & Scan"
+    if: ${{ !cancelled() && !failure() }}
     needs: [lint-and-test, security-scan]
     runs-on: ubuntu-latest
     timeout-minutes: 30

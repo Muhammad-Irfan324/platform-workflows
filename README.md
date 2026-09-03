@@ -136,43 +136,50 @@ module repos never create infrastructure, and the deployment repo holds no reusa
 │  Open a pull request                                         │
 └────────────────────┬─────────────────────────────────────────┘
                      │
-        ┌────────────┴────────────────┐
-        ▼                             ▼
-┌───────────────────────┐   ┌──────────────────────────────┐
-│ lint-and-test         │   │ security-scan                │
-│ ├─ npm ci             │   │ ├─ SonarQube (SAST)          │
-│ ├─ lint               │   │ ├─ OWASP Dependency-Check    │
-│ ├─ unit tests         │   │ └─ Gitleaks (secret scan)    │
-│ └─ integration tests  │   └──────────────┬───────────────┘
-└───────────┬───────────┘                  │
-            │                              │
-            ▼                              │
-┌──────────────────────────┐               │
-│ docker-build-scan        │               │
-│ ├─ Docker build (Buildx) │               │
-│ ├─ Trivy (image scan)    │               │
-│ └─ SARIF → Security tab  │               │
-└───────────┬──────────────┘               │
-            └──────────────┬───────────────┘
-                           ▼
-                    ┌─────────────┐
-                    │  All pass?  │
-                    └──────┬──────┘
-                           │ yes
-                           ▼
-                 ┌─────────────────────┐
-                 │ Review & merge      │
-                 │ to main             │
-                 └──────────┬──────────┘
-                            │
-                            ▼
-                 ┌──────────────────────────┐
-                 │ docker-build-scan        │
-                 │ ├─ rebuild + scan        │
-                 │ ├─ SARIF → Security tab  │
-                 │ └─ push to GitLab CR     │
-                 │     + provenance + SBOM  │
-                 └──────────────────────────┘
+                     ▼
+          ┌───────────────────────┐
+          │ lint-and-test         │
+          │ ├─ npm ci             │
+          │ ├─ lint               │
+          │ ├─ unit tests         │
+          │ └─ integration tests  │
+          └───────────┬───────────┘
+                      │
+                      ▼
+          ┌──────────────────────────────┐
+          │ security-scan                │
+          │ ├─ SonarQube (SAST)          │
+          │ ├─ OWASP Dependency-Check    │
+          │ └─ Gitleaks (secret scan)    │
+          └──────────────┬───────────────┘
+                         │
+                         ▼
+          ┌──────────────────────────┐
+          │ docker-build-scan        │
+          │ ├─ Docker build (Buildx) │
+          │ ├─ Trivy (image scan)    │
+          │ └─ SARIF → Security tab  │
+          └──────────────┬───────────┘
+                         │
+                         ▼
+                  ┌─────────────┐
+                  │  All pass?  │
+                  └──────┬──────┘
+                         │ yes
+                         ▼
+               ┌─────────────────────┐
+               │ Review & merge      │
+               │ to main             │
+               └──────────┬──────────┘
+                          │
+                          ▼
+               ┌──────────────────────────┐
+               │ docker-build-scan        │
+               │ ├─ rebuild + scan        │
+               │ ├─ SARIF → Security tab  │
+               │ └─ push to GitLab CR     │
+               │     + provenance + SBOM  │
+               └──────────────────────────┘
 ```
 
 ### Central configuration feeds both
